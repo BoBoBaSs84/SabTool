@@ -32,6 +32,19 @@ public sealed class StreamBlock
     public uint[] EntryCounts { get; } = new uint[9];
     public Entry[][] Entries { get; } = new Entry[9][];
     public Dictionary<Crc, Crc[]> FenceTree { get; } = new();
+    /// <summary>
+    /// The fence tree in file order, duplicates included, so it can be written back unchanged.
+    /// </summary>
+    public List<KeyValuePair<Crc, Crc[]>> FenceTreeList { get; } = new();
+    public int EntriesUnk { get; set; }
+    /// <summary>
+    /// The header data size stored in the pack. 0 means the header data comes from the map.
+    /// </summary>
+    public uint HeaderDataSize { get; set; }
+    /// <summary>
+    /// Bytes after the last payload of a pack, kept to allow a byte exact rewrite.
+    /// </summary>
+    public byte[] TrailingData { get; set; }
     public uint Count1ACFor1B0And1B4_1AC { get; set; }
     public Crc[] Array1B0 { get; set; }
     public byte[] Array1B4 { get; set; }
@@ -77,7 +90,12 @@ public sealed class StreamBlock
         public int CompressedSize { get; set; }
         public int UncompressedSize { get; set; }
         public byte[] Payload { get; set; }
+        public int Int10 { get; set; }
         public Crc SpawnTag { get; set; }
+
+        public Entry()
+        {
+        }
 
         public Entry(BinaryReader reader)
         {
@@ -85,8 +103,18 @@ public sealed class StreamBlock
             Offset = reader.ReadInt32();
             CompressedSize = reader.ReadInt32();
             UncompressedSize = reader.ReadInt32();
-            _ = reader.ReadInt32();
+            Int10 = reader.ReadInt32();
             SpawnTag = new(reader.ReadUInt32());
+        }
+
+        public void Write(BinaryWriter writer)
+        {
+            writer.Write(Crc.Value);
+            writer.Write(Offset);
+            writer.Write(CompressedSize);
+            writer.Write(UncompressedSize);
+            writer.Write(Int10);
+            writer.Write(SpawnTag.Value);
         }
     }
 }

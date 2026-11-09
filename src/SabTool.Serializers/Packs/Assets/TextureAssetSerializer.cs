@@ -221,6 +221,27 @@ public static class TextureAssetSerializer
         // DDS_HEADER end
     }
 
+    /// <summary>
+    /// Reads the uncompressed mip data size from a raw texture payload without decompressing it.
+    /// </summary>
+    /// <returns>The data size, or null if the payload is not a texture.</returns>
+    public static int? PeekDataSize(byte[] payload)
+    {
+        if (payload.Length < 4)
+            return null;
+
+        var nameLength = BitConverter.ToInt32(payload, 0);
+        if (nameLength < 0 || nameLength > 1024)
+            return null;
+
+        // name, format, flags, width, height, mip count
+        var dataSizeOffset = 4 + nameLength + 4 + 4 + 2 + 2 + 2;
+        if (payload.Length < dataSizeOffset + 4)
+            return null;
+
+        return BitConverter.ToInt32(payload, dataSizeOffset);
+    }
+
     public static void SerializeRaw(TextureAsset textureAsset, Stream stream)
     {
         using var writer = new BinaryWriter(stream, Encoding.UTF8, true);

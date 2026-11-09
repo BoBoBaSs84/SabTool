@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 using Newtonsoft.Json;
@@ -62,6 +64,7 @@ public static class StreamBlockSerializer
         using var reader = new BinaryReader(stream, Encoding.UTF8, true);
 
         streamBlock.HeaderEnd = reader.ReadUInt32();
+        streamBlock.HeaderDataSize = streamBlock.HeaderEnd;
         if (streamBlock.HeaderEnd > 0)
             ReadHeaderData(streamBlock, reader);
 
@@ -122,6 +125,9 @@ public static class StreamBlockSerializer
             ++offInd;
         }
         while (offInd < 9);
+
+        var remaining = reader.BaseStream.Length - reader.BaseStream.Position;
+        streamBlock.TrailingData = remaining > 0 ? reader.ReadBytes((int)remaining) : Array.Empty<byte>();
     }
 
     public static void ReadHeaderData(StreamBlock streamBlock, BinaryReader reader)
@@ -146,6 +152,9 @@ public static class StreamBlockSerializer
 
     public static void ReadTextureInfo(StreamBlock streamBlock, BinaryReader reader)
     {
+        // The same StreamBlock instance can be read more than once (map, then pack)
+        streamBlock.TotalTextureSize = 0;
+
         streamBlock.TextureCount = reader.ReadUInt32();
         if (streamBlock.TextureCount > 0)
         {
@@ -183,7 +192,7 @@ public static class StreamBlockSerializer
 
     public static void ReadEntries(StreamBlock streamBlock, BinaryReader reader)
     {
-        _ = reader.ReadInt32();
+        streamBlock.EntriesUnk = reader.ReadInt32();
 
         for (var i = 0; i < streamBlock.EntryCounts.Length; ++i)
             streamBlock.EntryCounts[i] = reader.ReadUInt32();
@@ -205,26 +214,191 @@ public static class StreamBlockSerializer
         for (var i = 0; i < streamBlock.PaletteCount; ++i)
             streamBlock.Palettes[i] = new Crc(reader.ReadUInt32());
 
+        // The same StreamBlock instance can be read more than once (map, then pack)
+        streamBlock.FenceTree.Clear();
+        streamBlock.FenceTreeList.Clear();
+
         streamBlock.FenceTreeCount = reader.ReadInt32();
         for (var i = 0; i < streamBlock.FenceTreeCount; ++i)
         {
             var crc = new Crc(reader.ReadUInt32());
             var subCnt = reader.ReadInt32();
+            var children = reader.ReadConstArray(subCnt, () => new Crc(reader.ReadUInt32()));
 
-            try
-            {
-                streamBlock.FenceTree.Add(crc, reader.ReadConstArray(subCnt, () => new Crc(reader.ReadUInt32())));
-            }
-            catch
-            {
+            streamBlock.FenceTreeList.Add(new(crc, children));
+
+            if (!streamBlock.FenceTree.TryAdd(crc, children))
                 Console.WriteLine("Trying to add multiple fence tree by the same id!");
-            }
         }
     }
 
+    public static void WriteHeaderData(StreamBlock streamBlock, BinaryWriter writer)
+    {
+        if ((streamBlock.Flags & 0x1C00) == 0x400)
+        {
+            writer.WriteHeaderString("HEI1", reversed: true);
+            writer.Write(streamBlock.PointCountX);
+            writer.Write(streamBlock.PointCountY);
+            writer.Write(streamBlock.HeightRangeMin);
+            writer.Write(streamBlock.HeightRangeMax);
+            writer.Write(streamBlock.HeightMapData, 0, streamBlock.PointCountX * streamBlock.PointCountY);
+        }
+
+        WriteTextureInfo(streamBlock, writer);
+        WriteEntries(streamBlock, writer);
+    }
+
+    public static void WriteTextureInfo(StreamBlock streamBlock, BinaryWriter writer)
+    {
+        writer.Write(streamBlock.TextureCount);
+        for (var i = 0; i < streamBlock.TextureCount; ++i)
+        {
+            writer.Write(streamBlock.TextureInfoArray[i].Crc.Value);
+            writer.Write(streamBlock.TextureInfoArray[i].UncompressedSize);
+        }
+
+        writer.Write(streamBlock.TextureCount2);
+        for (var i = 0; i < streamBlock.TextureCount2; ++i)
+        {
+            writer.Write(streamBlock.TextureInfoArray2[i].Crc.Value);
+            writer.Write(streamBlock.TextureInfoArray2[i].UncompressedSize);
+        }
+    }
+
+    public static void WriteEntries(StreamBlock streamBlock, BinaryWriter writer)
+    {
+        writer.Write(streamBlock.EntriesUnk);
+
+        for (var i = 0; i < streamBlock.EntryCounts.Length; ++i)
+            writer.Write(streamBlock.EntryCounts[i]);
+
+        writer.Write(streamBlock.Count1ACFor1B0And1B4_1AC);
+        for (var i = 0; i < streamBlock.Count1ACFor1B0And1B4_1AC; ++i)
+            writer.Write(streamBlock.Array1B0[i].Value);
+
+        writer.Write((int)streamBlock.PaletteCount);
+        for (var i = 0; i < streamBlock.PaletteCount; ++i)
+            writer.Write(streamBlock.Palettes[i].Value);
+
+        writer.Write(streamBlock.FenceTreeList.Count);
+        foreach (var (crc, children) in streamBlock.FenceTreeList)
+        {
+            writer.Write(crc.Value);
+            writer.Write(children.Length);
+
+            foreach (var child in children)
+                writer.Write(child.Value);
+        }
+    }
+
+    /// <summary>
+    /// Writes the 24 byte entries in <see cref="StreamBlock.OffIndices"/> order.
+    /// </summary>
+    public static void WriteEntryTable(StreamBlock streamBlock, BinaryWriter writer)
+    {
+        foreach (var entry in EnumerateEntries(streamBlock))
+            entry.Write(writer);
+    }
+
+    /// <summary>
+    /// Writes the payloads back to back, in the same order as <see cref="ReadPayloads"/> reads them.
+    /// </summary>
+    public static void WritePayloads(StreamBlock streamBlock, BinaryWriter writer)
+    {
+        foreach (var entry in EnumerateEntries(streamBlock))
+            writer.Write(entry.Payload);
+    }
+
+    /// <summary>
+    /// Recomputes the offsets and compressed sizes from the loaded payloads. The payloads are laid out back to back,
+    /// starting at the offset of the first entry, the same way <see cref="ReadPayloads"/> reads them.
+    /// </summary>
+    public static void UpdateEntryOffsets(StreamBlock streamBlock)
+    {
+        int? offset = null;
+
+        foreach (var entry in EnumerateEntries(streamBlock))
+        {
+            if (entry.Payload == null)
+                throw new InvalidOperationException($"The payload of {entry.Crc} is not loaded!");
+
+            offset ??= entry.Offset;
+
+            entry.Offset = offset.Value;
+            entry.CompressedSize = entry.Payload.Length;
+
+            offset += entry.Payload.Length;
+        }
+    }
+
+    /// <summary>
+    /// Enumerates the entries in file order (<see cref="StreamBlock.OffIndices"/>).
+    /// </summary>
+    public static IEnumerable<StreamBlock.Entry> EnumerateEntries(StreamBlock streamBlock)
+    {
+        foreach (var off in StreamBlock.OffIndices)
+        {
+            if (streamBlock.EntryCounts[off] == 0)
+                continue;
+
+            for (var i = 0; i < streamBlock.EntryCounts[off]; ++i)
+                yield return streamBlock.Entries[off][i];
+        }
+    }
+
+    /// <summary>
+    /// Replaces the payload of a texture entry and updates the dependent sizes.
+    /// </summary>
+    /// <remarks>
+    /// The size rules are inferred from the original values until <c>pack analyze</c> confirms them:
+    /// a size that equals the payload length follows the payload length, any other size moves by the change of the texture's data size.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The block's texture info comes from the map and would have to change.</exception>
+    public static void ReplaceTexturePayload(StreamBlock streamBlock, StreamBlock.Entry entry, byte[] payload)
+    {
+        var oldPayload = entry.Payload ?? throw new InvalidOperationException($"The payload of {entry.Crc} is not loaded!");
+
+        var oldDataSize = TextureAssetSerializer.PeekDataSize(oldPayload) ?? throw new InvalidOperationException($"The original payload of {entry.Crc} is not a texture!");
+        var newDataSize = TextureAssetSerializer.PeekDataSize(payload) ?? throw new InvalidOperationException($"The replacement payload of {entry.Crc} is not a texture!");
+
+        var oldUncompressedSize = entry.UncompressedSize;
+        var newUncompressedSize = oldUncompressedSize == oldPayload.Length
+            ? payload.Length
+            : oldUncompressedSize + newDataSize - oldDataSize;
+
+        var textureInfos = (streamBlock.TextureInfoArray ?? Array.Empty<StreamBlock.TextureInfo>())
+            .Concat(streamBlock.TextureInfoArray2 ?? Array.Empty<StreamBlock.TextureInfo>())
+            .Where(ti => ti.Crc == entry.Crc)
+            .ToArray();
+
+        var newInfoSizes = textureInfos
+            .Select(ti => ti.UncompressedSize == (uint)oldUncompressedSize
+                ? (uint)newUncompressedSize
+                : (uint)(ti.UncompressedSize + newDataSize - oldDataSize))
+            .ToArray();
+
+        var infoChanges = textureInfos.Where((ti, i) => ti.UncompressedSize != newInfoSizes[i]).Any();
+        if (infoChanges && streamBlock.HeaderDataSize == 0)
+            throw new InvalidOperationException($"The texture info of {entry.Crc} lives in the map and its size would change, writing maps is not supported!");
+
+        for (var i = 0; i < textureInfos.Length; ++i)
+        {
+            streamBlock.TotalTextureSize = streamBlock.TotalTextureSize - textureInfos[i].UncompressedSize + newInfoSizes[i];
+            textureInfos[i].UncompressedSize = newInfoSizes[i];
+        }
+
+        entry.UncompressedSize = newUncompressedSize;
+        entry.Payload = payload;
+    }
+
+    /// <summary>
+    /// Writes the header data part only (the counterpart of <see cref="ReadHeaderData"/>).
+    /// </summary>
     public static void SerializeRaw(StreamBlock streamBlock, Stream stream)
     {
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, true);
 
+        WriteHeaderData(streamBlock, writer);
     }
 
     public static StreamBlock? DeserializeJSON(Stream stream)

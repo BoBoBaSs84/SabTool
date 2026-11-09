@@ -3,6 +3,10 @@
 public sealed class Megapack
 {
     public Dictionary<Crc, FileEntry> FileEntries { get; set; } = new();
+    /// <summary>
+    /// The file entries in the order of the file table.
+    /// </summary>
+    public List<FileEntry> EntriesInFileOrder { get; set; } = new();
     public uint FileCount { get; set; }
     public Tuple<Crc, Crc>[] BlockPathToNameCrcs { get; set; }
 }
